@@ -155,18 +155,24 @@ struct texture1d_t {
     uint64 tex;  // CUtexObject handle (GPU) or Texture* (CPU)
     int32 width;
     int32 num_channels;
+    int32 filter_mode;
+    int32 use_normalized_coords;
 
     CUDA_CALLABLE inline texture1d_t()
         : tex(0)
         , width(0)
         , num_channels(0)
+        , filter_mode(0)
+        , use_normalized_coords(1) 
     {
     }
 
-    CUDA_CALLABLE inline texture1d_t(uint64 tex, int32 width, int32 num_channels)
+    CUDA_CALLABLE inline texture1d_t(uint64 tex, int32 width, int32 num_channels, int32 filter_mode, int32 use_normalized_coords)
         : tex(tex)
         , width(width)
         , num_channels(num_channels)
+        , filter_mode(filter_mode)
+        , use_normalized_coords(use_normalized_coords)
     {
     }
 };
@@ -176,20 +182,26 @@ struct texture2d_t {
     int32 width;
     int32 height;
     int32 num_channels;
+    int32 filter_mode;
+    int32 use_normalized_coords;
 
     CUDA_CALLABLE inline texture2d_t()
         : tex(0)
         , width(0)
         , height(0)
         , num_channels(0)
+        , filter_mode(0)
+        , use_normalized_coords(1) 
     {
     }
 
-    CUDA_CALLABLE inline texture2d_t(uint64 tex, int32 width, int32 height, int32 num_channels)
+    CUDA_CALLABLE inline texture2d_t(uint64 tex, int32 width, int32 height, int32 num_channels, int32 filter_mode, int32 use_normalized_coords)
         : tex(tex)
         , width(width)
         , height(height)
         , num_channels(num_channels)
+        , filter_mode(filter_mode)
+        , use_normalized_coords(use_normalized_coords) 
     {
     }
 };
@@ -200,6 +212,8 @@ struct texture3d_t {
     int32 height;
     int32 depth;
     int32 num_channels;
+    int32 filter_mode;
+    int32 use_normalized_coords;
 
     CUDA_CALLABLE inline texture3d_t()
         : tex(0)
@@ -207,15 +221,19 @@ struct texture3d_t {
         , height(0)
         , depth(0)
         , num_channels(0)
+        , filter_mode(0)
+        , use_normalized_coords(1)
     {
     }
 
-    CUDA_CALLABLE inline texture3d_t(uint64 tex, int32 width, int32 height, int32 depth, int32 num_channels)
+    CUDA_CALLABLE inline texture3d_t(uint64 tex, int32 width, int32 height, int32 depth, int32 num_channels, int32 filter_mode, int32 use_normalized_coords)
         : tex(tex)
         , width(width)
         , height(height)
         , depth(depth)
         , num_channels(num_channels)
+        , filter_mode(filter_mode)
+        , use_normalized_coords(use_normalized_coords)
     {
     }
 };
@@ -785,19 +803,51 @@ template <typename T> CUDA_CALLABLE T texture_sample(const texture3d_t& tex, flo
     return texture_sample_helper<T>::sample_3d(tex, u, v, w);
 }
 
-// Adjoint stubs for texture sampling (non-differentiable for now)
+// Adjoints for texture sampling
 template <typename T>
 CUDA_CALLABLE void
 adj_texture_sample(const texture1d_t& tex, float u, texture1d_t& adj_tex, float& adj_u, const T& adj_ret)
 {
-    // Texture sampling is not differentiable in this implementation
-}
+    if (tex.filter_mode == WP_TEXTURE_FILTER_CLOSEST)
+        return;
 
-template <typename T>
-CUDA_CALLABLE void
-adj_texture_sample(const texture2d_t& tex, const vec2f& uv, texture2d_t& adj_tex, vec2f& adj_uv, const T& adj_ret)
-{
-    // Texture sampling is not differentiable in this implementation
+    float gtx_mult = tex.use_normalized_coords ? (float)tex.width : 1.0f;
+
+#if defined(__CUDA_ARCH__)
+    float raw_tx = tex.use_normalized_coords ? u * (float)tex.width - 0.5f : u - 0.5f;
+    int x0 = (int)floor(raw_tx);
+    int x1 = x0 + 1;
+
+    if (x0 >= 0 && x1 < tex.width) {
+        float u0 = tex.use_normalized_coords ? ((float)x0 + 0.5f) / (float)tex.width : (float)x0 + 0.5f;
+        float u1 = tex.use_normalized_coords ? ((float)x1 + 0.5f) / (float)tex.width : (float)x1 + 0.5f;
+        float gtx = 0.0f;
+        for (int c = 0; c < tex.num_channels; c++)
+            gtx += (tex1D<float>(tex.tex, u1) - tex1D<float>(tex.tex, u0)) * ((const float*)&adj_ret)[c];
+        adj_u += gtx_mult * gtx;
+    }
+#else
+    if (tex.tex == 0)
+        return;
+    const Texture* cpu_tex = (const Texture*)tex.tex;
+
+    float coord_u = cpu_tex->use_normalized_coords ? u : (u / (float)cpu_tex->width);
+    float raw_tx = coord_u * (float)cpu_tex->width - 0.5f;
+    float tx = cpu_apply_address_mode_1d(coord_u, cpu_tex->width, cpu_tex->address_mode_u);
+
+    int x0_raw = (int)floor(raw_tx); int x1_raw = x0_raw + 1;
+    int x0 = (int)floor(tx);         int x1 = x0 + 1;
+
+    if (cpu_in_bounds_1d(x0_raw, cpu_tex->width) && cpu_in_bounds_1d(x1_raw, cpu_tex->width)) {
+        int x0w = cpu_apply_address_mode_index(x0, cpu_tex->width, cpu_tex->address_mode_u);
+        int x1w = cpu_apply_address_mode_index(x1, cpu_tex->width, cpu_tex->address_mode_u);
+        float gtx = 0.0f;
+        for (int c = 0; c < cpu_tex->num_channels; c++)
+            gtx += (cpu_fetch_texel_1d(cpu_tex, x1w, c) - cpu_fetch_texel_1d(cpu_tex, x0w, c))
+                   * ((const float*)&adj_ret)[c];
+        adj_u += gtx_mult * gtx;
+    }
+#endif
 }
 
 template <typename T>
@@ -805,14 +855,86 @@ CUDA_CALLABLE void adj_texture_sample(
     const texture2d_t& tex, float u, float v, texture2d_t& adj_tex, float& adj_u, float& adj_v, const T& adj_ret
 )
 {
-    // Texture sampling is not differentiable in this implementation
+    if (tex.filter_mode == WP_TEXTURE_FILTER_CLOSEST)
+        return;
+
+    float gtx_mult = tex.use_normalized_coords ? (float)tex.width  : 1.0f;
+    float gty_mult = tex.use_normalized_coords ? (float)tex.height : 1.0f;
+
+#if defined(__CUDA_ARCH__)
+    float raw_tx = tex.use_normalized_coords ? u * (float)tex.width  - 0.5f : u - 0.5f;
+    float raw_ty = tex.use_normalized_coords ? v * (float)tex.height - 0.5f : v - 0.5f;
+    int x0 = (int)floor(raw_tx); int x1 = x0 + 1;
+    int y0 = (int)floor(raw_ty); int y1 = y0 + 1;
+    float fx = raw_tx - (float)x0;
+    float fy = raw_ty - (float)y0;
+
+    bool x_ok = (x0 >= 0 && x1 < tex.width);
+    bool y_ok = (y0 >= 0 && y1 < tex.height);
+
+    auto fetch = [&](int x, int y) -> float {
+        float uf = tex.use_normalized_coords ? ((float)x + 0.5f) / (float)tex.width  : (float)x + 0.5f;
+        float vf = tex.use_normalized_coords ? ((float)y + 0.5f) / (float)tex.height : (float)y + 0.5f;
+        return tex2D<float>(tex.tex, uf, vf);
+    };
+
+    float gtx = 0.0f, gty = 0.0f;
+    for (int c = 0; c < tex.num_channels; c++) {
+        float gOut = ((const float*)&adj_ret)[c];
+        float v00 = fetch(x0,y0); float v10 = fetch(x1,y0);
+        float v01 = fetch(x0,y1); float v11 = fetch(x1,y1);
+        if (x_ok) gtx += ((v10-v00)*(1.0f-fy) + (v11-v01)*fy) * gOut;
+        if (y_ok) gty += ((v01-v00)*(1.0f-fx) + (v11-v10)*fx) * gOut;
+    }
+    adj_u += gtx_mult * gtx;
+    adj_v += gty_mult * gty;
+#else
+    if (tex.tex == 0)
+        return;
+    const Texture* cpu_tex = (const Texture*)tex.tex;
+
+    float coord_u = cpu_tex->use_normalized_coords ? u : (u / (float)cpu_tex->width);
+    float coord_v = cpu_tex->use_normalized_coords ? v : (v / (float)cpu_tex->height);
+    float raw_tx = coord_u * (float)cpu_tex->width  - 0.5f;
+    float raw_ty = coord_v * (float)cpu_tex->height - 0.5f;
+    float tx = cpu_apply_address_mode_1d(coord_u, cpu_tex->width,  cpu_tex->address_mode_u);
+    float ty = cpu_apply_address_mode_1d(coord_v, cpu_tex->height, cpu_tex->address_mode_v);
+
+    int x0_raw = (int)floor(raw_tx); int x1_raw = x0_raw + 1;
+    int y0_raw = (int)floor(raw_ty); int y1_raw = y0_raw + 1;
+    int x0 = (int)floor(tx); int x1 = x0 + 1;
+    int y0 = (int)floor(ty); int y1 = y0 + 1;
+    float fx = tx - (float)x0;
+    float fy = ty - (float)y0;
+
+    bool x_ok = (cpu_in_bounds_1d(x0_raw, cpu_tex->width)  && cpu_in_bounds_1d(x1_raw, cpu_tex->width));
+    bool y_ok = (cpu_in_bounds_1d(y0_raw, cpu_tex->height) && cpu_in_bounds_1d(y1_raw, cpu_tex->height));
+
+    int x0w = cpu_apply_address_mode_index(x0, cpu_tex->width,  cpu_tex->address_mode_u);
+    int x1w = cpu_apply_address_mode_index(x1, cpu_tex->width,  cpu_tex->address_mode_u);
+    int y0w = cpu_apply_address_mode_index(y0, cpu_tex->height, cpu_tex->address_mode_v);
+    int y1w = cpu_apply_address_mode_index(y1, cpu_tex->height, cpu_tex->address_mode_v);
+
+    float gtx = 0.0f, gty = 0.0f;
+    for (int c = 0; c < cpu_tex->num_channels; c++) {
+        float gOut = ((const float*)&adj_ret)[c];
+        float v00 = cpu_fetch_texel_2d(cpu_tex, x0w, y0w, c);
+        float v10 = cpu_fetch_texel_2d(cpu_tex, x1w, y0w, c);
+        float v01 = cpu_fetch_texel_2d(cpu_tex, x0w, y1w, c);
+        float v11 = cpu_fetch_texel_2d(cpu_tex, x1w, y1w, c);
+        if (x_ok) gtx += ((v10-v00)*(1.0f-fy) + (v11-v01)*fy) * gOut;
+        if (y_ok) gty += ((v01-v00)*(1.0f-fx) + (v11-v10)*fx) * gOut;
+    }
+    adj_u += gtx_mult * gtx;
+    adj_v += gty_mult * gty;
+#endif
 }
 
 template <typename T>
 CUDA_CALLABLE void
-adj_texture_sample(const texture3d_t& tex, const vec3f& uvw, texture3d_t& adj_tex, vec3f& adj_uvw, const T& adj_ret)
+adj_texture_sample(const texture2d_t& tex, const vec2f& uv, texture2d_t& adj_tex, vec2f& adj_uv, const T& adj_ret)
 {
-    // Texture sampling is not differentiable in this implementation
+    adj_texture_sample(tex, uv[0], uv[1], adj_tex, adj_uv[0], adj_uv[1], adj_ret);
 }
 
 template <typename T>
@@ -828,7 +950,117 @@ CUDA_CALLABLE void adj_texture_sample(
     const T& adj_ret
 )
 {
-    // Texture sampling is not differentiable in this implementation
+    if (tex.filter_mode == WP_TEXTURE_FILTER_CLOSEST)
+        return;
+
+    float gtx_mult = tex.use_normalized_coords ? (float)tex.width  : 1.0f;
+    float gty_mult = tex.use_normalized_coords ? (float)tex.height : 1.0f;
+    float gtz_mult = tex.use_normalized_coords ? (float)tex.depth  : 1.0f;
+
+#if defined(__CUDA_ARCH__)
+    float raw_tx = tex.use_normalized_coords ? u * (float)tex.width  - 0.5f : u - 0.5f;
+    float raw_ty = tex.use_normalized_coords ? v * (float)tex.height - 0.5f : v - 0.5f;
+    float raw_tz = tex.use_normalized_coords ? w * (float)tex.depth  - 0.5f : w - 0.5f;
+    int x0 = (int)floor(raw_tx); int x1 = x0 + 1;
+    int y0 = (int)floor(raw_ty); int y1 = y0 + 1;
+    int z0 = (int)floor(raw_tz); int z1 = z0 + 1;
+    float fx = raw_tx - (float)x0;
+    float fy = raw_ty - (float)y0;
+    float fz = raw_tz - (float)z0;
+
+    bool x_ok = (x0 >= 0 && x1 < tex.width);
+    bool y_ok = (y0 >= 0 && y1 < tex.height);
+    bool z_ok = (z0 >= 0 && z1 < tex.depth);
+
+    auto fetch = [&](int x, int y, int z) -> float {
+        float uf = tex.use_normalized_coords ? ((float)x + 0.5f) / (float)tex.width  : (float)x + 0.5f;
+        float vf = tex.use_normalized_coords ? ((float)y + 0.5f) / (float)tex.height : (float)y + 0.5f;
+        float wf = tex.use_normalized_coords ? ((float)z + 0.5f) / (float)tex.depth  : (float)z + 0.5f;
+        return tex3D<float>(tex.tex, uf, vf, wf);
+    };
+
+    float gtx = 0.0f, gty = 0.0f, gtz = 0.0f;
+    for (int c = 0; c < tex.num_channels; c++) {
+        float gOut = ((const float*)&adj_ret)[c];
+        float v000 = fetch(x0,y0,z0); float v100 = fetch(x1,y0,z0);
+        float v010 = fetch(x0,y1,z0); float v110 = fetch(x1,y1,z0);
+        float v001 = fetch(x0,y0,z1); float v101 = fetch(x1,y0,z1);
+        float v011 = fetch(x0,y1,z1); float v111 = fetch(x1,y1,z1);
+        if (x_ok) gtx += (((v100-v000)*(1.0f-fy) + (v110-v010)*fy) * (1.0f-fz)
+                        + ((v101-v001)*(1.0f-fy) + (v111-v011)*fy) * fz) * gOut;
+        if (y_ok) gty += (((v010-v000)*(1.0f-fx) + (v110-v100)*fx) * (1.0f-fz)
+                        + ((v011-v001)*(1.0f-fx) + (v111-v101)*fx) * fz) * gOut;
+        if (z_ok) gtz += (((v001-v000)*(1.0f-fx) + (v101-v100)*fx) * (1.0f-fy)
+                        + ((v011-v010)*(1.0f-fx) + (v111-v110)*fx) * fy) * gOut;
+    }
+    adj_u += gtx_mult * gtx;
+    adj_v += gty_mult * gty;
+    adj_w += gtz_mult * gtz;
+#else
+    if (tex.tex == 0)
+        return;
+    const Texture* cpu_tex = (const Texture*)tex.tex;
+
+    float coord_u = cpu_tex->use_normalized_coords ? u : (u / (float)cpu_tex->width);
+    float coord_v = cpu_tex->use_normalized_coords ? v : (v / (float)cpu_tex->height);
+    float coord_w = cpu_tex->use_normalized_coords ? w : (w / (float)cpu_tex->depth);
+    float raw_tx = coord_u * (float)cpu_tex->width  - 0.5f;
+    float raw_ty = coord_v * (float)cpu_tex->height - 0.5f;
+    float raw_tz = coord_w * (float)cpu_tex->depth  - 0.5f;
+    float tx = cpu_apply_address_mode_1d(coord_u, cpu_tex->width,  cpu_tex->address_mode_u);
+    float ty = cpu_apply_address_mode_1d(coord_v, cpu_tex->height, cpu_tex->address_mode_v);
+    float tz = cpu_apply_address_mode_1d(coord_w, cpu_tex->depth,  cpu_tex->address_mode_w);
+
+    int x0_raw = (int)floor(raw_tx); int x1_raw = x0_raw + 1;
+    int y0_raw = (int)floor(raw_ty); int y1_raw = y0_raw + 1;
+    int z0_raw = (int)floor(raw_tz); int z1_raw = z0_raw + 1;
+    int x0 = (int)floor(tx); int x1 = x0 + 1;
+    int y0 = (int)floor(ty); int y1 = y0 + 1;
+    int z0 = (int)floor(tz); int z1 = z0 + 1;
+    float fx = tx - (float)x0;
+    float fy = ty - (float)y0;
+    float fz = tz - (float)z0;
+
+    bool x_ok = (cpu_in_bounds_1d(x0_raw, cpu_tex->width)  && cpu_in_bounds_1d(x1_raw, cpu_tex->width));
+    bool y_ok = (cpu_in_bounds_1d(y0_raw, cpu_tex->height) && cpu_in_bounds_1d(y1_raw, cpu_tex->height));
+    bool z_ok = (cpu_in_bounds_1d(z0_raw, cpu_tex->depth)  && cpu_in_bounds_1d(z1_raw, cpu_tex->depth));
+
+    int x0w = cpu_apply_address_mode_index(x0, cpu_tex->width,  cpu_tex->address_mode_u);
+    int x1w = cpu_apply_address_mode_index(x1, cpu_tex->width,  cpu_tex->address_mode_u);
+    int y0w = cpu_apply_address_mode_index(y0, cpu_tex->height, cpu_tex->address_mode_v);
+    int y1w = cpu_apply_address_mode_index(y1, cpu_tex->height, cpu_tex->address_mode_v);
+    int z0w = cpu_apply_address_mode_index(z0, cpu_tex->depth,  cpu_tex->address_mode_w);
+    int z1w = cpu_apply_address_mode_index(z1, cpu_tex->depth,  cpu_tex->address_mode_w);
+
+    float gtx = 0.0f, gty = 0.0f, gtz = 0.0f;
+    for (int c = 0; c < cpu_tex->num_channels; c++) {
+        float gOut = ((const float*)&adj_ret)[c];
+        float v000 = cpu_fetch_texel_3d(cpu_tex, x0w, y0w, z0w, c);
+        float v100 = cpu_fetch_texel_3d(cpu_tex, x1w, y0w, z0w, c);
+        float v010 = cpu_fetch_texel_3d(cpu_tex, x0w, y1w, z0w, c);
+        float v110 = cpu_fetch_texel_3d(cpu_tex, x1w, y1w, z0w, c);
+        float v001 = cpu_fetch_texel_3d(cpu_tex, x0w, y0w, z1w, c);
+        float v101 = cpu_fetch_texel_3d(cpu_tex, x1w, y0w, z1w, c);
+        float v011 = cpu_fetch_texel_3d(cpu_tex, x0w, y1w, z1w, c);
+        float v111 = cpu_fetch_texel_3d(cpu_tex, x1w, y1w, z1w, c);
+        if (x_ok) gtx += (((v100-v000)*(1.0f-fy) + (v110-v010)*fy) * (1.0f-fz)
+                        + ((v101-v001)*(1.0f-fy) + (v111-v011)*fy) * fz) * gOut;
+        if (y_ok) gty += (((v010-v000)*(1.0f-fx) + (v110-v100)*fx) * (1.0f-fz)
+                        + ((v011-v001)*(1.0f-fx) + (v111-v101)*fx) * fz) * gOut;
+        if (z_ok) gtz += (((v001-v000)*(1.0f-fx) + (v101-v100)*fx) * (1.0f-fy)
+                        + ((v011-v010)*(1.0f-fx) + (v111-v110)*fx) * fy) * gOut;
+    }
+    adj_u += gtx_mult * gtx;
+    adj_v += gty_mult * gty;
+    adj_w += gtz_mult * gtz;
+#endif
+}
+
+template <typename T>
+CUDA_CALLABLE void
+adj_texture_sample(const texture3d_t& tex, const vec3f& uvw, texture3d_t& adj_tex, vec3f& adj_uvw, const T& adj_ret)
+{
+    adj_texture_sample(tex, uvw[0], uvw[1], uvw[2], adj_tex, adj_uvw[0], adj_uvw[1], adj_uvw[2], adj_ret);
 }
 
 // Type aliases for code generation
